@@ -1,0 +1,28 @@
+{
+  "name": "stockquery-mcp",
+  "description": "Demo MCP server exposing inventory tools for ChatGPT App integration (demo).",
+  "tools": [
+    {
+      "name": "get_low_stock",
+      "description": "Return low stock items for a given store",
+      "endpoint": "/tool/get_low_stock",
+      "method": "GET",
+      "params": {
+        "store_id": "integer",
+        "threshold": "integer"
+      }
+    },
+    {
+      "name": "transfer_stock",
+      "description": "Transfer stock between stores",
+      "endpoint": "/tool/transfer_stock",
+      "method": "POST",
+      "params": {
+        "product_name": "string",
+        "from_store": "integer",
+        "to_store": "integer",
+        "quantity": "integer"
+      }
+    }
+  ]
+}

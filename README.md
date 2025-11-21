@@ -33,3 +33,8 @@ Lightweight demo repo: FastAPI backend + an MCP-like tool server + local assista
 ## Notes
 - This is a learning/demo project. For production you should add authentication, TLS, proper error handling and tests.
 - The assistant client expects the model to output a JSON object indicating tool calls; model behavior may vary. You can also bypass the model and call the tool endpoints directly.
+
+## License
+This project is licensed under the MIT License.  
+Copyright © 2025 Prashant Kumar Mahskey
+

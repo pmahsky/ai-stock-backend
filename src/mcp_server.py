@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Dict, Optional
 import requests, os, json, asyncio
 from openai import OpenAI
-from db import init_db, get_stock_overview, connect, update_stock
+from src.db import init_db, get_stock_overview, connect, update_stock
 
 app = FastAPI(title="Stock Assistant MCP Server")
 
@@ -127,6 +127,37 @@ async def chat_stream(body: ChatRequest):
             await asyncio.sleep(0.01)
     return StreamingResponse(stream_tool(), media_type="text/event-stream")
 
+
+# ----------------------------
+# Tool Endpoints (Direct Access)
+# ----------------------------
+@app.get("/tool/get_low_stock")
+def tool_get_low_stock(store_id: int, threshold: int = 10):
+    """Proxy for get_low_stock tool."""
+    # We can reuse the logic in run_tool or call the backend directly
+    # Reusing run_tool logic for consistency requires mocking the tool dict
+    tool = {
+        "action": "get_low_stock",
+        "args": {"store_id": store_id}
+    }
+    # run_tool returns a ChatResponse, but the Android app expects the raw JSON structure
+    # So we should probably hit the backend directly like run_tool does, but return the raw data
+    try:
+        r = requests.get(f"{BACKEND_URL}/low_stock/{store_id}?threshold={threshold}")
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/tool/transfer_stock")
+def tool_transfer_stock(body: dict = Body(...)):
+    """Proxy for transfer_stock tool."""
+    # The Android app sends: product_name, from_store, to_store, quantity
+    # Backend expects: product_name, from_store, to_store, quantity
+    try:
+        r = requests.post(f"{BACKEND_URL}/transfer_stock", json=body)
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
 
 # ----------------------------
 # Tool runner

@@ -1,7 +1,8 @@
 import sqlite3
 from tabulate import tabulate
 
-DB_PATH = "store.db"
+import os
+DB_PATH = os.path.join(os.path.dirname(__file__), "store.db")
 
 def connect():
     return sqlite3.connect(DB_PATH)

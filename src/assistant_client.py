@@ -1,14 +1,15 @@
 # assistant_client.py – streamlined test chat for MCP tools
 import os, re, json, requests
-from openai import OpenAI
+import google.generativeai as genai
 
 MCP_TOOL_URL = "http://localhost:3100"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("❌ Please set OPENAI_API_KEY in your environment")
+if not GEMINI_API_KEY:
+    raise RuntimeError("❌ Please set GEMINI_API_KEY in your environment")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-flash-latest')
 
 SYSTEM_PROMPT = """
 You are a helpful retail stock assistant.
@@ -23,15 +24,17 @@ Otherwise, respond normally in natural language.
 """
 
 def call_model(prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=400,
-    )
-    return resp.choices[0].message.content
+    full_prompt = f"{SYSTEM_PROMPT}\n\nUser: {prompt}"
+    try:
+        resp = model.generate_content(
+            full_prompt,
+            generation_config={"response_mime_type": "application/json"} 
+            # Note: We enforce JSON because the system prompt asks for it, 
+            # and it makes parsing easier for this script's logic.
+        )
+        return resp.text
+    except Exception as e:
+        return f"Error: {e}"
 
 def invoke_tool(obj: dict):
     tool = obj.get("tool")
@@ -51,15 +54,10 @@ def invoke_tool(obj: dict):
         print(f"Tool Response: {json.dumps(tool_result, indent=2)}")
 
         # Ask model for friendly rephrase
-        followup = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant for a store inventory system."},
-                {"role": "user", "content": f"Summarize this response in a short sentence: {tool_result}"},
-            ],
-            max_tokens=100,
+        followup = model.generate_content(
+            f"You are a helpful assistant. Summarize this response in a short sentence: {tool_result}"
         )
-        print("Assistant:", followup.choices[0].message.content.strip())
+        print("Assistant:", followup.text.strip())
 
     except requests.RequestException as e:
         print("❌ Tool call failed:", e)

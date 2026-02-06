@@ -5,13 +5,20 @@ from pydantic import BaseModel
 from typing import Dict, Optional
 import requests, os, json, asyncio
 from openai import OpenAI
-from src.db import init_db, get_stock_overview, connect, update_stock
+from src.db import init_db, get_stock_overview, connect, update_stock, get_unique_product_names
 
 app = FastAPI(title="Stock Assistant MCP Server")
 
+import google.generativeai as genai
+
 BACKEND_URL = "http://localhost:8000"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ WARNING: GEMINI_API_KEY not set!")
+
+genai.configure(api_key=GEMINI_API_KEY)
+# Using gemini-2.0-flash-001 (Specific version)
+model = genai.GenerativeModel('gemini-2.0-flash-001')
 
 # ----------------------------
 # Session memory
@@ -25,24 +32,50 @@ def add_to_memory(session_id: str, text: str):
 # ----------------------------
 # Intent routing prompt
 # ----------------------------
-SYSTEM_PROMPT = """
+# ----------------------------
+# Intent routing prompt
+# ----------------------------
+# ----------------------------
+# Intent routing prompt
+# ----------------------------
+BASE_SYSTEM_PROMPT = """
 You are a smart store inventory assistant for retail operations.
 
 TOOLS YOU CAN TRIGGER:
-1) get_low_stock(store_id)
+1) get_low_stock(store_id, product=null)
 2) transfer_stock(product, from_store, to_store, qty)
+3) get_product_info(product, store_id=null)
 
-You MUST convert natural language into tool parameters when possible.
+VALID PRODUCTS:
+{product_list}
+
+RULES:
+- You MUST convert natural language into tool parameters when possible.
+- AUTO-CORRECT typos to the nearest VALID PRODUCT from the list.
+  (e.g., "soaps" -> "Soap", "cokes" -> "Coke 500ml")
+- If the user implies "any store" or "where can I find", set "store_id": null.
+- If the user asks about a specific store (e.g., "in store 101"), set "store_id": 101.
+- USE HISTORY to resolve implicit arguments. If user asks "is it low?", check previous messages for the store/product being discussed.
 
 Examples:
 "show low stock of store 103"
-→ {"action":"get_low_stock","args":{"store_id":103}}
+→ {{"action":"get_low_stock","args":{{"store_id":103}}}}
 
 "transfer 5 milk from store 101 to 103"
-→ {"action":"transfer_stock","args":{"product":"milk","from_store":101,"to_store":103,"qty":5}}
+→ {{"action":"transfer_stock","args":{{"product":"Milk 1L","from_store":101,"to_store":103,"qty":5}}}}
+
+"How many cokes do we have?"
+→ {{"action":"get_product_info","args":{{"product":"Coke 500ml","store_id":null}}}}
+
+"Price of bread in store 102"
+→ {{"action":"get_product_info","args":{{"product":"Bread","store_id":102}}}}
+
+(Context: User previously asked "Where is Soap?" -> Found in Store 103)
+"Is it low in stock?"
+→ {{"action":"get_low_stock","args":{{"store_id":103, "product":"Soap"}}}}
 
 If input is casual conversation, return:
-{"action":"none","reply":"<natural reply>"}
+{{"action":"none","reply":"<natural reply>"}}
 """
 
 # ----------------------------
@@ -64,22 +97,31 @@ def chat(body: ChatRequest):
     session_id = body.session_id
     add_to_memory(session_id, f"User: {user_msg}")
 
+    # 1. Fetch valid products dynamically
+    try:
+        products = get_unique_product_names()
+        product_list_str = ", ".join(products)
+    except Exception:
+        product_list_str = "None available"
+
+    # 2. Inject into prompt
+    system_prompt = BASE_SYSTEM_PROMPT.format(product_list=product_list_str)
+
     history = "\n".join(SESSION_MEMORY[session_id])
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user","content":f"History:\n{history}\nUser: {user_msg}"}
-        ]
-    )
+    # Construct complete prompt
+    full_prompt = f"{system_prompt}\n\nHistory:\n{history}\nUser: {user_msg}"
 
     try:
-        tool = json.loads(resp.choices[0].message.content)
-    except Exception:
-        reply = resp.choices[0].message.content
-        add_to_memory(session_id, f"Assistant: {reply}")
-        return ChatResponse(reply=reply)
+        resp = model.generate_content(
+            full_prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        content = resp.text
+        tool = json.loads(content)
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return ChatResponse(reply="Sorry, I'm having trouble connecting to the AI.")
 
     if tool.get("action") == "none":
         reply = tool.get("reply", "")
@@ -96,25 +138,41 @@ async def chat_stream(body: ChatRequest):
     add_to_memory(session_id, f"User: {user_msg}")
     history = "\n".join(SESSION_MEMORY[session_id])
 
-    decision = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user","content":f"History:\n{history}\nUser: {user_msg}"}
-        ]
-    )
+    # 1. Fetch valid products dynamically
     try:
-        tool = json.loads(decision.choices[0].message.content)
+        products = get_unique_product_names()
+        product_list_str = ", ".join(products)
     except Exception:
-        tool = {"action": "none", "reply": decision.choices[0].message.content}
+        product_list_str = "None available"
+
+    # 2. Inject into prompt
+    system_prompt = BASE_SYSTEM_PROMPT.format(product_list=product_list_str)
+
+    full_prompt = f"{system_prompt}\n\nHistory:\n{history}\nUser: {user_msg}"
+
+    try:
+        # We don't stream the decision part effectively with tools in this specific architecture
+        # because we need the full JSON to decide whether to run a tool or not.
+        # So we await the full response first.
+        resp = model.generate_content(
+            full_prompt,
+            generation_config={"response_mime_type": "application/json"}
+        )
+        content = resp.text
+        tool = json.loads(content)
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        tool = {"action": "none", "reply": "Sorry, service disruption."}
 
     # No tool: stream natural reply
     if tool["action"] == "none":
         async def stream_text():
-            reply = tool["reply"]
+            reply = tool.get("reply", "")
             add_to_memory(session_id, f"Assistant: {reply}")
-            for ch in reply:
-                yield ch
+            # Simulate streaming since we already have the full text from the JSON mode generation
+            chunk_size = 5 
+            for i in range(0, len(reply), chunk_size):
+                yield reply[i:i+chunk_size]
                 await asyncio.sleep(0.01)
         return StreamingResponse(stream_text(), media_type="text/event-stream")
 
@@ -122,9 +180,8 @@ async def chat_stream(body: ChatRequest):
     result = run_tool(tool, session_id).reply
     async def stream_tool():
         add_to_memory(session_id, f"Assistant: {result}")
-        for ch in result:
-            yield ch
-            await asyncio.sleep(0.01)
+        # Return full result at once or chunk it
+        yield result
     return StreamingResponse(stream_tool(), media_type="text/event-stream")
 
 
@@ -162,25 +219,51 @@ def tool_transfer_stock(body: dict = Body(...)):
 # ----------------------------
 # Tool runner
 # ----------------------------
+# ----------------------------
+# Tool runner
+# ----------------------------
+
+
+
+
 def run_tool(tool, session_id="default") -> ChatResponse:
     action = tool.get("action")
     args = tool.get("args", {})
 
     try:
         if action == "get_low_stock":
-            r = requests.get(f"{BACKEND_URL}/low_stock/{args['store_id']}")
+            args = tool.get("args", {})
+            store_id = args['store_id']
+            product = args.get("product")
+
+            params = {"threshold": args.get("threshold", 10)}
+            if product:
+                params["product"] = product
+            
+            r = requests.get(f"{BACKEND_URL}/low_stock/{store_id}", params=params)
             data = r.json()
-            reply = "Low stock items:\n" + "\n".join(
-                f"- {i['product']} ({i['qty']})"
-                for i in data.get("low_stock_items", [])
-            )
+            items = data.get("low_stock_items", [])
+
+            if product:
+                if not items:
+                    reply = f"I couldn't find '{product}' in Store {store_id}."
+                else:
+                    item = items[0]
+                    status = "LOW on stock" if item.get("is_low") else "sufficiently stocked"
+                    reply = f"In Store {store_id}, {item['product']} is {status}. We have {item['qty']} units left."
+            else:
+                # General check
+                if not items:
+                    reply = f"Good news! Store {store_id} has no low stock items right now."
+                else:
+                    items_str = ", ".join(f"{i['product']} ({i['qty']})" for i in items)
+                    reply = f"Attention: The following items are low in Store {store_id}: {items_str}."
+            
             add_to_memory(session_id, f"Assistant: {reply}")
-            return ChatResponse(reply=str(reply))
+            return ChatResponse(reply=reply)
 
         if action == "transfer_stock":
             args = tool.get("args", {})
-
-            # 🔧 Normalize keys for backend schema
             payload = {
                 "product_name": args.get("product") or args.get("product_name"),
                 "from_store": args.get("from_store"),
@@ -190,24 +273,49 @@ def run_tool(tool, session_id="default") -> ChatResponse:
             r = requests.post(f"{BACKEND_URL}/transfer_stock", json=payload)
             try:
                 data = r.json()
-                if isinstance(data, dict):
-                    reply = data.get("detail") or json.dumps(data)
-                elif isinstance(data, list):
-                    reply = json.dumps(data)
-                else:
-                    reply = str(data)
+                detail = data.get("detail") or str(data)
+                reply = f"Transfer complete: {detail}"
             except Exception as e:
-                reply = f"Error calling transfer API: {e}"
+                reply = f"There was an issue processing that transfer: {e}"
 
             add_to_memory(session_id, f"Assistant: {reply}")
-            return ChatResponse(reply=str(reply))
+            return ChatResponse(reply=reply)
+
+        if action == "get_product_info":
+            args = tool.get("args", {})
+            product = args.get("product")
+            store_id = args.get("store_id")
+
+            params = {"product_name": product}
+            if store_id:
+                params["store_id"] = store_id
+            
+            r = requests.get(f"{BACKEND_URL}/product_details", params=params)
+            data = r.json().get("results", [])
+            
+            if not data:
+                if store_id:
+                    reply = f"I couldn't find any information for '{product}' in Store {store_id}."
+                else:
+                    reply = f"I searched all stores but couldn't find '{product}'."
+            else:
+                if store_id:
+                    item = data[0]
+                    reply = f"Store {item['store_id']} has {item['qty']} units of {item['product']} ({item['uom']}). The price is ${item['price']}."
+                else:
+                    rows_str = [f"Store {i['store_id']} has {i['qty']} {i['uom']} (${i['price']})" for i in data]
+                    reply = f"I found '{product}' in these locations:\n" + "\n".join(rows_str)
+
+            add_to_memory(session_id, f"Assistant: {reply}")
+            return ChatResponse(reply=reply)
 
         reply = f"Unknown action: {action}"
         add_to_memory(session_id, f"Assistant: {reply}")
         return ChatResponse(reply=str(reply))
 
     except Exception as e:
-        reply = f"Unhandled error in run_tool: {e}"
+        reply = f"System Error: {e}"
+        # We don't naturalize system errors implies debugging
         add_to_memory(session_id, f"Assistant: {reply}")
         return ChatResponse(reply=str(reply))
 

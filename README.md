@@ -18,11 +18,11 @@ Lightweight demo repo: FastAPI backend + an MCP-like tool server + local assista
    ```
 2. Start backend:
    ```bash
-   uvicorn src.main:app --reload --port 8000
+   uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
    ```
 3. Start MCP tool server (in another terminal):
    ```bash
-   uvicorn src.mcp_server:app --reload --port 3000
+   uvicorn src.mcp_server:app --host 0.0.0.0 --reload --port 3000
    ```
 4. (Optional) Run assistant client:
    ```bash

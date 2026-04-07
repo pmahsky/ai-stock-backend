@@ -1,6 +1,6 @@
-# schemas.py - placeholder for Pydantic schemas if you want to expand
+# schemas.py - lightweight response models for the POC
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 class LowStockResponse(BaseModel):
     store_id: int
@@ -17,6 +17,8 @@ class TransferSuggestion(BaseModel):
     product: str
     suggested_qty: int
     frequency: int
+    score: float
+    confidence: str
     reason: str
 
 class TransferRecommendationResponse(BaseModel):
@@ -24,3 +26,18 @@ class TransferRecommendationResponse(BaseModel):
     to_store: int
     transfer_type: str
     suggestions: List[TransferSuggestion]
+
+
+class StoreDirectoryItem(BaseModel):
+    store_id: int
+    store_name: str
+    store_type: str
+    parent_store_id: Optional[int] = None
+
+
+class StoreDirectoryResponse(BaseModel):
+    items: List[StoreDirectoryItem]
+
+
+class ProductListResponse(BaseModel):
+    items: List[str]

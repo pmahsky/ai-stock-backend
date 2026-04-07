@@ -40,6 +40,11 @@ htmlcov/
 
 # SQLite databases
 src/store.db
+store.db
 
 # Logs
 *.log
+
+# Local verification helpers
+check_models.py
+verify_*.py

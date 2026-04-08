@@ -45,151 +45,97 @@ Expected:
   - Staff Canteen `301`
 - recommendation logic is local and deterministic
 
-## Recommendation Logic
-This POC recommends products by looking at recent transfer history for the exact route the user selected.
+## Recommendation Flow
+The transfer recommendation engine is a deterministic rules layer over seeded SQLite history.
 
-### Plain-English Flow
-1. User chooses source store, destination store, and transfer type.
-2. Backend looks at the last `30` days of transfer history for that exact route.
-3. It groups transfers by product and checks:
-   - how often the product moved
-   - how recent the last transfer was
-   - whether the quantities were fairly consistent
-   - whether the source store still has enough stock
-4. If the product passes the filters, the backend returns it as a recommendation.
-
-### Query Shape
-The backend uses a query shaped like:
-
-```sql
-SELECT product_name, COUNT(*), AVG(quantity), MIN(quantity), MAX(quantity), MAX(created_at)
-FROM transfer_history
-WHERE from_store = ?
-  AND to_store = ?
-  AND transfer_type = ?
-  AND created_at >= ?
-GROUP BY product_name
-HAVING COUNT(*) >= 3
-```
-
-### What Happens After the Query
-- `suggested_qty` is set to the rounded average transfer quantity
-- the quantity is capped by the source store stock minus reorder level
-- a score is calculated from frequency and recency
-- confidence is labeled as `high`, `medium`, or `low`
-
-### UI Meaning
-- `frequency` = how many times this exact route moved the product
-- `score` = simple strength number from `0` to `1`
-- `confidence` = human-friendly summary of the score
-- `reason` = short explanation like `frequently transferred recently`
-
-### Important Guardrails
-- no ML model is used for recommendation scoring
-- AI is only used for assistant conversation and guidance
-- if Gemini is unavailable or quota-limited, the MCP server uses local fallback logic
-
-## Recommendation Logic
-The transfer recommendation flow is intentionally simple for the POC.
-
-### Inputs
-- `from_store`
-- `to_store`
-- `transfer_type`
-
-These come from the Transfer Assist screen and are sent to:
+### API
+The app calls:
 
 ```bash
 GET /transfer_recommendations?from_store=101&to_store=301&transfer_type=CANTEEN
 ```
 
-### What the query asks
-In plain language, the backend asks:
+### Inputs
+- `from_store`
+- `to_store`
+- `transfer_type`
+- fixed lookback window: `30` days
 
-```text
-For this exact route and transfer type, what products were moved repeatedly in the last 30 days,
-what quantity was usually moved, and can the source store still spare that stock?
+### Query
+`src/db.py:get_transfer_recommendations()` runs a grouped query on `transfer_history` and joins `stock` for source inventory checks.
+
+```sql
+SELECT
+    th.product_name,
+    COUNT(*) AS frequency,
+    AVG(th.quantity) AS avg_qty,
+    MIN(th.quantity) AS min_qty,
+    MAX(th.quantity) AS max_qty,
+    MAX(th.created_at) AS last_transferred_at,
+    CAST(julianday('now') - julianday(MAX(th.created_at)) AS REAL) AS days_since_last,
+    s.quantity AS source_stock,
+    s.reorder_level AS reorder_level
+FROM transfer_history th
+JOIN stock s
+  ON s.store_id = th.from_store
+ AND lower(trim(s.product_name)) = lower(trim(th.product_name))
+WHERE th.from_store = ?
+  AND th.to_store = ?
+  AND upper(th.transfer_type) = ?
+  AND th.created_at >= ?
+GROUP BY th.product_name, s.quantity, s.reorder_level
+HAVING COUNT(*) >= 3
 ```
 
-### Query behavior
-The SQL in `src/db.py:get_transfer_recommendations()`:
-- filters to the exact `from_store`, `to_store`, and `transfer_type`
-- only checks the last `30` days
-- groups by product
-- calculates:
-  - transfer count
-  - average quantity
-  - min and max quantity
-  - latest transfer date
-  - current source stock
-  - reorder level
-- ignores products moved fewer than `3` times
+### Post-query filters
+- drop products with no usable average quantity
+- drop products with `quantity_spread_ratio > 0.75`
+- drop products where `source_stock <= reorder_level`
 
-### Filtering rules
-After the query returns grouped rows, Python applies these checks:
-- skip products with no usable average quantity
-- skip very inconsistent quantity history
-  - current rule: `(max_qty - min_qty) / avg_qty > 0.75`
-- skip products where source stock cannot spare quantity beyond reorder level
-
-### Suggested quantity
-The recommendation quantity is:
-
-```text
-rounded historical average, capped by available transferable stock
-```
-
-Formula:
-
+### Quantity formula
 ```python
 available_to_transfer = max(source_stock - reorder_level, 0)
 suggested_qty = min(max(int(round(avg_qty)), 1), available_to_transfer)
 ```
 
-### Score
-The score is a lightweight strength signal from `0.0` to `1.0`.
-
-It combines:
-- `frequency` as the main signal
-- `recency` as the secondary signal
-- `consistency` as a multiplier
-
-Formula:
-
+### Score formula
 ```python
 frequency_score = min(frequency / 6.0, 1.0)
 recency_score = max(0.0, 1.0 - (days_since_last / 30))
-
-score = ((frequency_score * 0.7) + (recency_score * 0.3)) * consistency_multiplier
+score = round(((frequency_score * 0.7) + (recency_score * 0.3)) * consistency_multiplier, 2)
 ```
 
-### Confidence labels
-- `high`
-  - `score >= 0.8` and `frequency >= 4`
-- `medium`
-  - `score >= 0.55`
-- `low`
-  - anything else that still passed filters
+### Confidence
+- `high`: `score >= 0.8` and `frequency >= 4`
+- `medium`: `score >= 0.55`
+- `low`: everything else that passed the filters
 
-### UI field meanings
-Each suggested item returns:
-- `product`
-  - item name
-- `suggested_qty`
-  - recommended starting quantity
-- `frequency`
-  - how many times this exact route moved the product in the last 30 days
-- `score`
-  - internal strength number
-- `confidence`
-  - `high`, `medium`, or `low`
-- `reason`
-  - short explanation such as `frequently transferred recently`
+### Response fields
+- `product`: product name
+- `suggested_qty`: recommended transfer quantity
+- `frequency`: how many times the route transferred the product
+- `score`: numeric strength from `0` to `1`
+- `confidence`: `high`, `medium`, or `low`
+- `reason`: short human-readable explanation
 
-### AI vs local logic
-- recommendation scoring itself is local and deterministic
-- the assistant layer may use Gemini for natural-language routing when available
-- when Gemini is unavailable or quota-limited, the MCP server falls back to local routing
+### Example interpretation
+```text
+Milk 1L
+High
+Suggested qty 18 • score 0.87 • moved 5 times
+frequently transferred recently
+```
+
+This means:
+- the route repeated often
+- the transfers were recent
+- quantities were stable enough
+- source stock could support the transfer
+
+### AI boundary
+- recommendation scoring is local only
+- Gemini is used for chat/routing when available
+- if Gemini returns `429` or is unavailable, the MCP server uses local fallback logic
 
 ## Useful Endpoints
 ```bash

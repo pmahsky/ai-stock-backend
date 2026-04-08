@@ -37,11 +37,41 @@ else:
     print("⚠️ WARNING: Gemini SDK or API key unavailable, using local intent fallback.")
 
 SESSION_MEMORY: dict[str, list[str]] = {}
+SESSION_CONTEXT: dict[str, dict[str, object]] = {}
 
 
 def add_to_memory(session_id: str, text: str):
     SESSION_MEMORY.setdefault(session_id, []).append(text)
     SESSION_MEMORY[session_id] = SESSION_MEMORY[session_id][-10:]
+
+
+def get_session_context(session_id: str) -> dict[str, object]:
+    return SESSION_CONTEXT.setdefault(session_id, {})
+
+
+def update_session_context(session_id: str, **kwargs):
+    context = get_session_context(session_id)
+    for key, value in kwargs.items():
+        if value is not None:
+            context[key] = value
+
+
+def clear_session_context(session_id: str, *keys: str):
+    context = get_session_context(session_id)
+    for key in keys:
+        context.pop(key, None)
+
+
+def apply_context_updates(session_id: str, tool: dict):
+    updates = tool.pop("context_updates", None)
+    if not isinstance(updates, dict):
+        return
+
+    clear_keys = updates.pop("__clear__", [])
+    if updates:
+        update_session_context(session_id, **updates)
+    if clear_keys:
+        clear_session_context(session_id, *clear_keys)
 
 
 BASE_SYSTEM_PROMPT = """
@@ -63,6 +93,7 @@ RULES:
 - Convert user requests into tool arguments whenever possible.
 - AUTO-CORRECT obvious product typos to the nearest valid product.
 - If the user asks what the app can do, how to use it, or says they are new, answer directly with a short onboarding-style reply.
+- Use the current app store context for ambiguous follow-up questions such as "is it low in stock?" or "what is the selected store?".
 - For transfer planning questions such as "what should I send", "suggest items", "frequent transfers", or "what goes to canteen/PFS", prefer get_transfer_recommendations.
 - For direct transfer requests such as "transfer 5 milk to PFS", do NOT execute a transfer in chat. Return open_transfer_assist so the app can open the structured transfer screen.
 - If source store is missing for a transfer question, prefer store 101 for this demo.
@@ -101,6 +132,7 @@ If the input is casual conversation, return:
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = "default"
+    current_store: Optional[int] = None
 
 
 class TransferAssistContext(BaseModel):
@@ -115,6 +147,7 @@ class ChatResponse(BaseModel):
     reply: str
     action: Optional[str] = None
     transfer_context: Optional[TransferAssistContext] = None
+    response_mode: str = "local_fallback"
 
 
 @app.get("/health")
@@ -189,11 +222,15 @@ def _infer_transfer_defaults(message: str, store_ids: list[int]):
     return from_store, to_store, transfer_type
 
 
-def _route_message_with_rules(message: str, valid_products: list[str]):
+def _route_message_with_rules(message: str, valid_products: list[str], session_context: dict[str, object]):
     lowered = message.lower().strip()
     store_ids = _extract_store_ids(message)
     qty_match = re.search(r"\b(\d+)\b", lowered)
     qty = int(qty_match.group(1)) if qty_match else None
+    current_store = session_context.get("current_store")
+    last_product = session_context.get("last_product")
+    last_store = session_context.get("last_store") or current_store
+    pending_intent = str(session_context.get("pending_intent") or "")
     product = None
 
     for candidate in valid_products:
@@ -211,6 +248,82 @@ def _route_message_with_rules(message: str, valid_products: list[str]):
         product = _normalize_product("soap", valid_products)
     elif not product and "coke" in lowered:
         product = _normalize_product("coke", valid_products)
+
+    if lowered in {"hello", "hi", "hey", "good morning", "good afternoon", "good evening"}:
+        store_hint = (
+            f" Current Home store is {_store_name(int(current_store))}."
+            if current_store
+            else ""
+        )
+        return {
+            "action": "none",
+            "reply": f"Hi. I can help with transfers, stock checks, and product lookup.{store_hint}",
+        }
+
+    if any(phrase in lowered for phrase in ["selected store", "current store", "which store is selected"]):
+        if current_store:
+            return {
+                "action": "none",
+                "reply": f"Selected store is {_store_name(int(current_store))}.",
+            }
+        return {
+            "action": "none",
+            "reply": "No Home store is selected yet.",
+        }
+
+    if pending_intent == "product_info" and product:
+        return {
+            "action": "get_product_info",
+            "args": {
+                "product": product,
+                "store_id": store_ids[0] if store_ids else None,
+            },
+            "context_updates": {"__clear__": ["pending_intent"]},
+        }
+
+    if any(
+        phrase in lowered
+        for phrase in ["is it low", "is it low in stock", "is this low", "is that low", "low in stock"]
+    ):
+        low_stock_product = product or last_product
+        low_stock_store = store_ids[0] if store_ids else last_store
+
+        if low_stock_product and low_stock_store:
+            return {
+                "action": "get_low_stock",
+                "args": {
+                    "store_id": int(low_stock_store),
+                    "product": str(low_stock_product),
+                },
+            }
+        if low_stock_product:
+            return {
+                "action": "none",
+                "reply": f"I can check {low_stock_product}. Which store should I use?",
+            }
+        return {
+            "action": "none",
+            "reply": "Tell me the product first, then I can check if it is low.",
+        }
+
+    if any(
+        phrase in lowered
+        for phrase in ["find product details", "product details", "product info", "item details"]
+    ):
+        if product:
+            return {
+                "action": "get_product_info",
+                "args": {
+                    "product": product,
+                    "store_id": store_ids[0] if store_ids else None,
+                },
+                "context_updates": {"__clear__": ["pending_intent"]},
+            }
+        return {
+            "action": "none",
+            "reply": "Which product should I check?",
+            "context_updates": {"pending_intent": "product_info"},
+        }
 
     if any(
         phrase in lowered
@@ -261,8 +374,8 @@ def _route_message_with_rules(message: str, valid_products: list[str]):
             "reply": "Try: 'suggest products for PFS 204', 'what should I transfer to staff canteen?', 'show low stock in store 103', or 'where is Milk 1L?'",
         }
 
-    if "low stock" in lowered or ("is it low" in lowered and store_ids):
-        args = {"store_id": store_ids[0] if store_ids else 101}
+    if "low stock" in lowered:
+        args = {"store_id": store_ids[0] if store_ids else int(last_store or 101)}
         if product:
             args["product"] = product
         return {"action": "get_low_stock", "args": args}
@@ -275,7 +388,13 @@ def _route_message_with_rules(message: str, valid_products: list[str]):
                     "product": product,
                     "store_id": store_ids[0] if store_ids else None,
                 },
+                "context_updates": {"__clear__": ["pending_intent"]},
             }
+        return {
+            "action": "none",
+            "reply": "Which product should I check?",
+            "context_updates": {"pending_intent": "product_info"},
+        }
 
     if any(keyword in lowered for keyword in ["suggest", "recommend", "frequent", "what should i transfer", "what goes"]):
         from_store, to_store, transfer_type = _infer_transfer_defaults(message, store_ids)
@@ -286,8 +405,18 @@ def _route_message_with_rules(message: str, valid_products: list[str]):
                     "from_store": from_store,
                     "to_store": to_store,
                     "transfer_type": transfer_type,
-                },
-            }
+            },
+        }
+
+    if product and len(lowered.split()) <= 3:
+        return {
+            "action": "get_product_info",
+            "args": {
+                "product": product,
+                "store_id": store_ids[0] if store_ids else None,
+            },
+            "context_updates": {"__clear__": ["pending_intent"]},
+        }
 
     if "transfer" in lowered or "move" in lowered:
         from_store, to_store, transfer_type = _infer_transfer_defaults(message, store_ids)
@@ -311,7 +440,9 @@ def _route_message_with_rules(message: str, valid_products: list[str]):
 def _route_message(message: str, session_id: str):
     valid_products = get_unique_product_names()
     stores = get_store_directory()
-    fallback_tool = _route_message_with_rules(message, valid_products)
+    session_context = get_session_context(session_id)
+    fallback_tool = _route_message_with_rules(message, valid_products, session_context)
+    fallback_tool.setdefault("response_mode", "local_fallback")
 
     if not model:
         return fallback_tool
@@ -326,7 +457,12 @@ def _route_message(message: str, session_id: str):
     )
 
     history = "\n".join(SESSION_MEMORY.get(session_id, []))
-    full_prompt = f"{system_prompt}\n\nHistory:\n{history}\nUser: {message}"
+    current_store_line = (
+        f"Current app store context: {_store_name(int(session_context['current_store']))}"
+        if session_context.get("current_store")
+        else "Current app store context: none"
+    )
+    full_prompt = f"{system_prompt}\n\n{current_store_line}\nHistory:\n{history}\nUser: {message}"
 
     try:
         resp = model.generate_content(
@@ -347,13 +483,14 @@ def _route_message(message: str, session_id: str):
         if not action:
             return fallback_tool
 
+        tool["response_mode"] = "gemini"
         return tool
     except Exception as exc:
         print(f"Gemini Error: {exc}")
         return fallback_tool
 
 
-def _build_transfer_assist_response(args, reply=None):
+def _build_transfer_assist_response(args, reply=None, response_mode="local_fallback"):
     context = TransferAssistContext(
         from_store=args.get("from_store"),
         to_store=args.get("to_store"),
@@ -379,6 +516,7 @@ def _build_transfer_assist_response(args, reply=None):
         reply=reply,
         action="open_transfer_assist",
         transfer_context=context,
+        response_mode=response_mode,
     )
 
 
@@ -386,22 +524,30 @@ def _build_transfer_assist_response(args, reply=None):
 def chat(body: ChatRequest):
     user_msg = body.message
     session_id = body.session_id
+    if body.current_store is not None:
+        update_session_context(session_id, current_store=body.current_store)
     add_to_memory(session_id, f"User: {user_msg}")
 
     tool = _route_message(user_msg, session_id)
+    apply_context_updates(session_id, tool)
     action = tool.get("action")
+    response_mode = tool.get("response_mode", "local_fallback")
 
     if action == "none":
         reply = tool.get("reply", "").strip() or "I’m ready to help with stock and transfer planning."
         add_to_memory(session_id, f"Assistant: {reply}")
-        return ChatResponse(reply=reply)
+        return ChatResponse(reply=reply, response_mode=response_mode)
 
     if action == "open_transfer_assist":
-        response = _build_transfer_assist_response(tool.get("args", {}), tool.get("reply"))
+        response = _build_transfer_assist_response(
+            tool.get("args", {}),
+            tool.get("reply"),
+            response_mode=response_mode,
+        )
         add_to_memory(session_id, f"Assistant: {response.reply}")
         return response
 
-    response = run_tool(tool, session_id)
+    response = run_tool(tool, session_id, response_mode=response_mode)
     add_to_memory(session_id, f"Assistant: {response.reply}")
     return response
 
@@ -454,7 +600,7 @@ def tool_transfer_stock(body: dict = Body(...)):
         return {"error": str(exc)}
 
 
-def run_tool(tool, session_id="default") -> ChatResponse:
+def run_tool(tool, session_id="default", response_mode="local_fallback") -> ChatResponse:
     action = tool.get("action")
     args = tool.get("args", {})
 
@@ -472,20 +618,33 @@ def run_tool(tool, session_id="default") -> ChatResponse:
             if product:
                 if not items:
                     return ChatResponse(
-                        reply=f"I couldn’t find {product} in {_store_name(store_id)}."
+                        reply=f"I couldn’t find {product} in {_store_name(store_id)}.",
+                        response_mode=response_mode,
                     )
                 item = items[0]
                 if item.get("is_low"):
                     reply = f"{item['product']} is low in {_store_name(store_id)}: {item['qty']} left."
                 else:
                     reply = f"{item['product']} is available in {_store_name(store_id)}: {item['qty']} on hand."
-                return ChatResponse(reply=reply)
+                update_session_context(
+                    session_id,
+                    last_product=item["product"],
+                    last_store=store_id,
+                )
+                return ChatResponse(reply=reply, response_mode=response_mode)
 
             if not items:
-                return ChatResponse(reply=f"No low stock items in {_store_name(store_id)}.")
+                return ChatResponse(
+                    reply=f"No low stock items in {_store_name(store_id)}.",
+                    response_mode=response_mode,
+                )
 
             items_str = ", ".join(f"{item['product']} ({item['qty']})" for item in items[:5])
-            return ChatResponse(reply=f"Low stock in {_store_name(store_id)}: {items_str}.")
+            update_session_context(session_id, last_store=store_id)
+            return ChatResponse(
+                reply=f"Low stock in {_store_name(store_id)}: {items_str}.",
+                response_mode=response_mode,
+            )
 
         if action == "get_product_info":
             product = args.get("product")
@@ -501,22 +660,61 @@ def run_tool(tool, session_id="default") -> ChatResponse:
             if not data:
                 if store_id:
                     return ChatResponse(
-                        reply=f"I couldn’t find {product} in {_store_name(store_id)}."
+                        reply=f"I couldn’t find {product} in {_store_name(store_id)}.",
+                        response_mode=response_mode,
                     )
                 return ChatResponse(
-                    reply=f"I couldn’t find any stock records for {product}."
+                    reply=f"I couldn’t find any stock records for {product}.",
+                    response_mode=response_mode,
                 )
 
             if store_id:
                 item = data[0]
+                update_session_context(
+                    session_id,
+                    last_product=item["product"],
+                    last_store=item["store_id"],
+                )
                 return ChatResponse(
-                    reply=f"{item['product']}: {item['qty']} units in {_store_name(item['store_id'])}, ${item['price']} per {item['uom']}."
+                    reply=f"{item['product']} in {_store_name(item['store_id'])}: {item['qty']} {item['uom']} on hand.",
+                    response_mode=response_mode,
+                )
+
+            current_store = get_session_context(session_id).get("current_store")
+            current_store_item = None
+            if current_store:
+                current_store_item = next(
+                    (item for item in data if item["store_id"] == int(current_store)),
+                    None,
                 )
 
             rows_str = ", ".join(
                 f"{_store_name(item['store_id'])}: {item['qty']} {item['uom']}" for item in data
             )
-            return ChatResponse(reply=f"{product} is available at {rows_str}.")
+            update_session_context(
+                session_id,
+                last_product=product,
+                last_store=current_store if current_store_item else None,
+            )
+
+            if current_store_item:
+                other_rows = ", ".join(
+                    f"{_store_name(item['store_id'])}: {item['qty']} {item['uom']}"
+                    for item in data
+                    if item["store_id"] != int(current_store)
+                )
+                reply = (
+                    f"{current_store_item['product']} in {_store_name(current_store_item['store_id'])}: "
+                    f"{current_store_item['qty']} {current_store_item['uom']} on hand."
+                )
+                if other_rows:
+                    reply = f"{reply} Elsewhere: {other_rows}."
+                return ChatResponse(reply=reply, response_mode=response_mode)
+
+            return ChatResponse(
+                reply=f"{product} is available at {rows_str}.",
+                response_mode=response_mode,
+            )
 
         if action == "get_transfer_recommendations":
             from_store = args.get("from_store")
@@ -535,7 +733,8 @@ def run_tool(tool, session_id="default") -> ChatResponse:
 
             if not suggestions:
                 return ChatResponse(
-                    reply=f"No strong repeat pattern for {_store_name(to_store)} yet. Use Transfer Assist to add items manually."
+                    reply=f"No strong repeat pattern for {_store_name(to_store)} yet. Use Transfer Assist to add items manually.",
+                    response_mode=response_mode,
                 )
 
             top_suggestions = suggestions[:3]
@@ -544,15 +743,20 @@ def run_tool(tool, session_id="default") -> ChatResponse:
                 for item in top_suggestions
             )
             return ChatResponse(
-                reply=f"Top picks for {_store_name(to_store)}: {summary}."
+                reply=f"Top picks for {_store_name(to_store)}: {summary}.",
+                response_mode=response_mode,
             )
 
-        return ChatResponse(reply="I understood the request, but I couldn’t map it to a supported action.")
+        return ChatResponse(
+            reply="I understood the request, but I couldn’t map it to a supported action.",
+            response_mode=response_mode,
+        )
 
     except Exception as exc:
         print(f"Tool Error: {exc}")
         return ChatResponse(
-            reply="I hit a local service issue while checking that. Please try again in a moment."
+            reply="I hit a local service issue while checking that. Please try again in a moment.",
+            response_mode=response_mode,
         )
 
 
